@@ -1,0 +1,61 @@
+=============================
+  Problem ID: 1
+
+        Provider: CUTLASS
+   OperationKind: gemm
+       Operation: cutlass_simt_sgemm_64x128_8x2_nn_align1
+
+          Status: Success
+    Verification: ON
+     Disposition: Passed
+
+reference_device: Passed
+          cuBLAS: Not run
+           cuDNN: Not run
+
+       Arguments: --gemm_kind=universal --m=4096 --n=4096 --k=4096 --A=f32:column --B=f32:column --C=f32:column --D=f32:column  \
+                  --alpha=1 --beta=0 --split_k_mode=serial --split_k_slices=1 --batch_count=1 --raster_order=heuristic  \
+                  --runtime_input_datatype_a=invalid --runtime_input_datatype_b=invalid --use_pdl=false --enable_sm90_mixed_dtype_shuffle_test=false  \
+                  --swizzle_size=1 --op_class=simt --accum=f32 --cta_m=64 --cta_n=128 --cta_k=8 --cluster_m=1 --cluster_n=1  \
+                  --cluster_k=1 --cluster_m_fallback=1 --cluster_n_fallback=1 --cluster_k_fallback=1 --stages=2 --warps_m=2  \
+                  --warps_n=2 --warps_k=1 --inst_m=1 --inst_n=1 --inst_k=1 --min_cc=50 --max_cc=1024
+
+           Bytes: 201326592  bytes
+           FLOPs: 137472507904  flops
+           FLOPs/Byte: 682
+
+         Runtime: 3.48016  ms
+          Memory: 53.8769 GiB/s
+
+            Math: 39501.8 GFLOP/s
+
+=============================
+  Problem ID: 1
+
+        Provider: CUTLASS
+   OperationKind: gemm
+       Operation: cutlass_simt_sgemm_128x128_8x2_nt_align1
+
+          Status: Success
+    Verification: ON
+     Disposition: Passed
+
+reference_device: Passed
+          cuBLAS: Not run
+           cuDNN: Not run
+
+       Arguments: --gemm_kind=universal --m=4096 --n=4096 --k=4096 --A=f32:column --B=f32:row --C=f32:column --D=f32:column  \
+                  --alpha=1 --beta=0 --split_k_mode=serial --split_k_slices=1 --batch_count=1 --raster_order=heuristic  \
+                  --runtime_input_datatype_a=invalid --runtime_input_datatype_b=invalid --use_pdl=false --enable_sm90_mixed_dtype_shuffle_test=false  \
+                  --swizzle_size=1 --op_class=simt --accum=f32 --cta_m=128 --cta_n=128 --cta_k=8 --cluster_m=1 --cluster_n=1  \
+                  --cluster_k=1 --cluster_m_fallback=1 --cluster_n_fallback=1 --cluster_k_fallback=1 --stages=2 --warps_m=4  \
+                  --warps_n=2 --warps_k=1 --inst_m=1 --inst_n=1 --inst_k=1 --min_cc=50 --max_cc=1024
+
+           Bytes: 201326592  bytes
+           FLOPs: 137472507904  flops
+           FLOPs/Byte: 682
+
+         Runtime: 3.47532  ms
+          Memory: 53.9518 GiB/s
+
+            Math: 39556.7 GFLOP/s

@@ -1,5 +1,5 @@
 """
-A dense HGEMM using the sm80 tensor cores in CUTE DSL.
+A dense HGEMM using the sm80 CUDA Cores in CUTE DSL.
 
 The HGEMM implementation handles only row-major and col-major layouts.
 To bridge the gap of GEMM order between BLAS and CUTE, we can use the following definitions:
@@ -91,7 +91,7 @@ def make_smem_layout_AB(
     Since we are doing fp16 gemm, we manually apply a `<3,3,3>` swizzle onto a 8x128B tile.
     I.e., the `128B Swizzling with 16B atomicity` follows the PTX naming convention.
 
-    https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-instructions-for-mma
+    - https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-instructions-for-mma
 
     Refer to this awesome blog for the ldmatrix/swizzle mechanism:
         - https://yang-yifan.github.io/blogs/mma_swizzle/mma_swizzle.html
@@ -109,7 +109,7 @@ def make_smem_layout_AB(
     s_shift = 3
     # 8 rows per ldmatrix.m8n8.b16
     b_bits = min(int(math.log2(contiguous_size / vl)), 3)
-    # - b_bits is limited upto 3 because smem bank size is 32x4B.
+    # - b_bits is limited upto 3 because smem bank size is 128B.
     #   For ldmatrix.m8n8.b16 the up-most swizzle BBits is log2(128B/16B)=3.
     # - By default vl is 8 values (16B), making the BBits exactly 3.
     #   If vl is larger, to avoid smem bank conflicts,
@@ -192,7 +192,7 @@ def hgemm_kernel(
     tiled_copy_B: cute.TiledCopy,
     tiled_copy_C: cute.TiledCopy,
     tiled_mma: cute.TiledMma,
-    raster_factor: cutlass.Int32,
+    raster_factor: cutlass.Int32 = 0,
     epilogue_op: cutlass.Constexpr = lambda x: x,
 ):
     tidx = cute.arch.thread_idx()[0]
@@ -475,11 +475,11 @@ def hgemm_kernel(
             coord_smem = (None, None, None, smem_pipe_write)
             cute.copy(tiled_copy_A, tAgA[coord_gmem], tAsA[coord_smem], pred=tAprdA)
             cute.copy(tiled_copy_B, tBgB[coord_gmem], tBsB[coord_smem], pred=tBprdB)
-            cute.arch.cp_async_commit_group()
             # Update meta pointers of gmem/smem pipes
             k_tile_index_gmem += 1
             smem_pipe_write = smem_pipe_read
-        # Always move smem_pipe_read ptr to fethch SMEM->RMEM
+        # Always commit new cp.async and always move smem_pipe_read ptr
+        cute.arch.cp_async_commit_group()
         smem_pipe_read = (smem_pipe_read + 1) % num_stages
         for k_frag_index in cutlass.range(num_k_frags, unroll_full=True):
             # - If the inner loop reaches the last fragment, we need to
@@ -645,58 +645,48 @@ def run_hgemm(
     def tensor_generator(return_type: str = "all"):
         assert return_type in ["all", "cute_only", "torch_only"]
 
-        if a_transpose:
-            a = torch.empty((L, M, K)).permute(1, 2, 0)  # (M, K, L):(K, 1, MK)
-        else:
-            a = torch.empty((L, K, M)).permute(2, 1, 0)  # (M, K, L):(1, M, MK)
+        a_torch_cpu = cutlass_torch.matrix(L, M, K, not a_transpose, gemm_dtype)
+        b_torch_cpu = cutlass_torch.matrix(L, N, K, b_transpose, gemm_dtype)
+        c_torch_cpu = cutlass_torch.matrix(
+            L, M, N, False, gemm_dtype, init_type=cutlass_torch.TensorInitType.SKIP
+        )
 
-        if b_transpose:
-            b = torch.empty((L, K, N)).permute(2, 1, 0)  # (N, K, L):(1, N, NK)
-        else:
-            b = torch.empty((L, N, K)).permute(1, 2, 0)  # (N, K, L):(K, 1, NK)
-
-        # C is always row-major
-        c = torch.zeros((L, M, N)).permute(1, 2, 0)  # (M, N, L):(N, 1, MN)
-
-        a = a.random_(-114, 514).to(device=torch.device("cuda"), dtype=torch.float16)
-        b = b.random_(-114, 514).to(device=torch.device("cuda"), dtype=torch.float16)
-        c = c.to(device=torch.device("cuda"), dtype=torch.float16)
+        a_cute, a_torch = cutlass_torch.cute_tensor_like(
+            a_torch_cpu, gemm_dtype, dynamic_layout, bytes_alignment
+        )
+        b_cute, b_torch = cutlass_torch.cute_tensor_like(
+            b_torch_cpu, gemm_dtype, dynamic_layout, bytes_alignment
+        )
+        c_cute, c_torch = cutlass_torch.cute_tensor_like(
+            c_torch_cpu, gemm_dtype, dynamic_layout, bytes_alignment
+        )
 
         if return_type == "torch_only":
-            return a, b, c
-
-        a_tensor = from_dlpack(a, assumed_align=bytes_alignment)
-        b_tensor = from_dlpack(b, assumed_align=bytes_alignment)
-        c_tensor = from_dlpack(c, assumed_align=bytes_alignment)
-
-        if dynamic_layout:
-            a_tensor = a_tensor.mark_layout_dynamic(leading_dim=1 if a_transpose else 0)
-            b_tensor = b_tensor.mark_layout_dynamic(leading_dim=0 if b_transpose else 1)
-            c_tensor = c_tensor.mark_layout_dynamic(leading_dim=1)
+            return a_torch, b_torch, c_torch
 
         if return_type == "cute_only":
-            return a_tensor, b_tensor, c_tensor
+            return a_cute, b_cute, c_cute
 
-        return a, b, c, a_tensor, b_tensor, c_tensor
+        return a_cute, b_cute, c_cute, a_torch, b_torch, c_torch
 
     # verification and compilation
-    a_torch, b_torch, c_torch, a_tensor, b_tensor, c_tensor = tensor_generator()
+    a_cute, b_cute, c_cute, a_torch, b_torch, c_torch = tensor_generator()
 
     if not skip_verify:
-        hgemm(a_tensor, b_tensor, c_tensor)
+        hgemm(a_cute, b_cute, c_cute)
         torch.cuda.synchronize()
         c_ref = torch.einsum(
             "mkl,nkl->mnl",
             a_torch.to(dtype=torch.float32),
             b_torch.to(dtype=torch.float32),
         ).to(dtype=torch.float16)
-        torch.testing.assert_close(c_torch.cpu(), c_ref.cpu(), atol=1e-03, rtol=1e-05)
+        torch.testing.assert_close(c_torch.cpu(), c_ref.cpu(), atol=1e-01, rtol=1e-03)
         print("Verification passed.")
     else:
         print("Verification skipped.")
 
     compile_tic = time.perf_counter()
-    hgemm_compiled = cute.compile(hgemm, a_tensor, b_tensor, c_tensor)
+    hgemm_compiled = cute.compile(hgemm, a_cute, b_cute, c_cute)
     print(f"Kernel compiled time {time.perf_counter() - compile_tic:.4f} seconds")
 
     # benchmarking

@@ -1,1 +1,0 @@
-https://leimao.github.io/blog/CUDA-Shared-Memory-Swizzling/

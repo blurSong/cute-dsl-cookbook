@@ -19,27 +19,48 @@ References:
 
 """
 
-import time
-import math
-import torch
 import argparse
+import copy
+import math
+import time
+from functools import partial
 from typing import Union
+
+import cuda.bindings.driver as cuda
+import torch
 from utils import *
 
 import cutlass
 import cutlass.cute as cute
-import cutlass.utils as utils
+import cutlass.cute.nvgpu as nvgpu
 import cutlass.cute.testing as testing
 import cutlass.torch as cutlass_torch
+import cutlass.utils as utils
 from cutlass.cute.runtime import from_dlpack
-
-import cuda.bindings.driver as cuda
 
 VERBOSE = False
 LOG = "[CuTe Info]"
 
+# Here, in Lei's blog, they use (32, 64) for cta tiler and
+# (8, 32)/(32, 8) for thread tiler.
+# We follow the same setting here for better comparison
 cta_tiler = (64, 64)
 thr_tiler = (8, 32)
+thr_tiler_t = (32, 8)
+assert all(cta_tiler[i] % thr_tiler[i] == 0 for i in range(2))
+assert all(cta_tiler[i] % thr_tiler_t[i] == 0 for i in range(2))
+
+
+def constexpr_log2(x: int) -> int:
+    return 0 if x < 2 else 1 + constexpr_log2(x // 2)
+
+
+@cutlass.dsl_user_op
+def get_swizzle_bms(dtype: cute.Numeric, *, loc=None, ip=None):
+    m = constexpr_log2(1)
+    b = constexpr_log2(32 * 32 // dtype.width) - m
+    s = constexpr_log2(cta_tiler[1]) - m
+    return b, m, s
 
 
 @cute.kernel
@@ -50,37 +71,37 @@ def transpose_naive_kernel(
     thr_layout: cute.Layout,
     global_shape: cutlass.Shape,
 ):
-    dtype = gA.element_type
-    bid_x, bid_y, _ = cute.arch.block_idx()
-    tid_x, _, _ = cute.arch.thread_idx()
+    blk_x, blk_y, _ = cute.arch.block_idx()
+    thr_x, _, _ = cute.arch.thread_idx()
 
-    cta_coord = ((None, None), bid_x, bid_y)
+    # Note that here y denotes the grid row index of res_m
+    # and x denotes the grid column index of res_n
+    cta_coord = ((None, None), blk_y, blk_x)
     gA = gA[cta_coord]
     gB = gB[cta_coord]
-    tAgA = cute.local_partition(gA, thr_layout, tid_x)
-    tBgB = cute.local_partition(gB, thr_layout, tid_x)
+    tAgA = cute.local_partition(gA, thr_layout, thr_x)
+    tBgB = cute.local_partition(gB, thr_layout, thr_x)
 
-    tArA = cute.make_fragment_like(tAgA)
+    tArA = cute.make_rmem_tensor_like(tAgA)
 
     if VERBOSE:
         print(f"gA: {gA}")
         print(f"gB: {gB}")
         print(f"tAgA: {tAgA}")
         print(f"tBgB: {tBgB}")
-        print(f"tArA: {tArA}")
 
     # Make coordinate prediction
     gCrd = gCrd[cta_coord]
-    tAgCrd = cute.local_partition(gCrd, thr_layout, tid_x)
-    tArCrd = cute.make_fragment_like(tAgCrd, cutlass.Boolean)
+    tAgCrd = cute.local_partition(gCrd, thr_layout, thr_x)
+    tArPrd = cute.make_rmem_tensor_like(tAgCrd, cutlass.Boolean)
 
-    for i in range(cute.size(tArCrd), unroll=1):
-        tArCrd[i] = cute.elem_less(tAgCrd[i], global_shape)
+    for i in range(cute.size(tArPrd)):
+        tArPrd[i] = cute.elem_less(tAgCrd[i], global_shape)
 
-    copy_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), dtype)
+    copy_atom = cute.make_copy_atom(nvgpu.CopyUniversalOp(), gA.element_type)
 
-    cute.copy(copy_atom, tAgA, tArA, pred=tArCrd)
-    cute.copy(copy_atom, tArA, tBgB, pred=tArCrd)
+    cute.copy(copy_atom, tAgA, tArA, pred=tArPrd)
+    cute.copy(copy_atom, tArA, tBgB, pred=tArPrd)
 
 
 @cute.kernel
@@ -90,28 +111,28 @@ def transpose_smem_kernel(
     gCrd: cute.Tensor,
     thr_layout_a: cute.Layout,
     thr_layout_b: cute.Layout,
-    smem_layout_a: Union[cute.Layout, cute.ComposedLayout],
-    smem_layout_b: Union[cute.Layout, cute.ComposedLayout],
+    smem_layout: cute.Layout | cute.ComposedLayout,
+    copy_atom_a: cute.CopyAtom,
+    copy_atom_b: cute.CopyAtom,
     global_shape: cutlass.Shape,
 ):
-    dtype = gA.element_type
-    bid_x, bid_y, _ = cute.arch.block_idx()
-    tid_x, _, _ = cute.arch.thread_idx()
+    blk_x, blk_y, _ = cute.arch.block_idx()
+    thr_x, _, _ = cute.arch.thread_idx()
 
-    # Note: can also define swizzle here using allocate_tensor()
-    smem_ptr = cutlass.utils.SmemAllocator().allocate_array(dtype, cute.cosize(smem_layout_a))
+    sA = cutlass.utils.SmemAllocator().allocate_tensor(
+        gA.element_type,
+        smem_layout,
+    )
+    sB = cute.make_tensor(sA.iterator, smem_layout)  # Aliasing smem for B
 
-    sA = cute.make_tensor(smem_ptr, smem_layout_a)
-    sB = cute.make_tensor(smem_ptr, smem_layout_b)
-
-    cta_coord = ((None, None), bid_x, bid_y)
+    cta_coord = ((None, None), blk_y, blk_x)
     gA = gA[cta_coord]
     gB = gB[cta_coord]
 
-    tAgA = cute.local_partition(gA, thr_layout_a, tid_x)
-    tBgB = cute.local_partition(gB, thr_layout_b, tid_x)
-    tAsA = cute.local_partition(sA, thr_layout_a, tid_x)
-    tBsB = cute.local_partition(sB, thr_layout_b, tid_x)
+    tAgA = cute.local_partition(gA, thr_layout_a, thr_x)
+    tBgB = cute.local_partition(gB, thr_layout_b, thr_x)
+    tAsA = cute.local_partition(sA, thr_layout_a, thr_x)
+    tBsB = cute.local_partition(sB, thr_layout_b, thr_x)
 
     if VERBOSE:
         print(f"gA: {gA}")
@@ -123,37 +144,40 @@ def transpose_smem_kernel(
 
     # Make coordinate prediction
     gCrd = gCrd[cta_coord]
-    tAgCrd = cute.local_partition(gCrd, thr_layout_a, tid_x)
-    tBgCrd = cute.local_partition(gCrd, thr_layout_b, tid_x)
-    tArCrd = cute.make_fragment_like(tAgCrd, cutlass.Boolean)
-    tBrCrd = cute.make_fragment_like(tBgCrd, cutlass.Boolean)
+    tAgCrd = cute.local_partition(gCrd, thr_layout_a, thr_x)
+    tBgCrd = cute.local_partition(gCrd, thr_layout_b, thr_x)
+    tArPrd = cute.make_rmem_tensor_like(tAgCrd, cutlass.Boolean)
+    tBrPrd = cute.make_rmem_tensor_like(tBgCrd, cutlass.Boolean)
 
-    for i in range(cute.size(tArCrd), unroll=1):
-        tArCrd[i] = cute.elem_less(tAgCrd[i], global_shape)
-    for i in range(cute.size(tBrCrd), unroll=1):
-        tBrCrd[i] = cute.elem_less(tBgCrd[i], global_shape)
+    for i in range(cute.size(tArPrd)):
+        tArPrd[i] = cute.elem_less(tAgCrd[i], global_shape)
+    for i in range(cute.size(tBrPrd)):
+        tBrPrd[i] = cute.elem_less(tBgCrd[i], global_shape)
 
-    copy_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), dtype)
-
-    cute.copy(copy_atom, tAgA, tAsA, pred=tArCrd)
+    # Practically we need to create tiled-copy for A and B. But we were being lazy
+    cute.basic_copy_if(tArPrd, tAgA, tAsA)
     cute.arch.cp_async_commit_group()
     cute.arch.cp_async_wait_group(0)
     cute.arch.barrier()
-    cute.copy(copy_atom, tBsB, tBgB, pred=tBrCrd)
+    # if blk_x == 0 and blk_y == 0 and thr_x == 0:
+    #    cute.print_tensor(tAgA)
+    #    cute.print_tensor(tAsA)
+    cute.basic_copy_if(tBrPrd, tBsB, tBgB)
+
+
+@cute.kernel
+def transpose_tma_kernel():
+    pass
 
 
 @cute.jit
 def transpose_naive(
     A: cute.Tensor,
     B: cute.Tensor,
-    stream: cuda.CUstream,
-    copy_bits: cutlass.Constexpr = 128,
+    coalesce_read: cutlass.Constexpr = True,
 ):
-    # War. For output matrix B, we define a column-major layout (M,N):(1,M)
+    # For output matrix B, we define a column-major layout (M,N):(1,M)
     B = cute.make_tensor(B.iterator, cute.make_layout(B.shape, stride=(1, B.shape[0])))
-
-    dtype = A.element_type
-    vl = copy_bits // dtype.width
 
     a_major_mode = utils.LayoutEnum.from_tensor(A)
     b_major_mode = utils.LayoutEnum.from_tensor(B)
@@ -169,13 +193,14 @@ def transpose_naive(
     gCrd = cute.tiled_divide(Crd, cta_tiler)
 
     # - Here we define 2 thread-level layouts for coalesced access
-    #   Either use (8,32) for A coalesced or (32,8) for B coalesced
-    # - Based on empirical testing, B coalesced achieves better performance
-    thr_layout_a_coalesced = cute.make_ordered_layout(thr_tiler, order=(1, 0))
-    thr_layout_b_coalesced = cute.make_ordered_layout(thr_tiler, order=(0, 1))
-    thr_layout = thr_layout_b_coalesced
+    #   Either use (8,32) row-major for A reading coalesced or (32,8) col-major
+    #   for B writing coalesced
+    if cutlass.const_expr(coalesce_read):
+        thr_layout = cute.make_ordered_layout(thr_tiler, order=(1, 0))
+    else:
+        thr_layout = cute.make_ordered_layout(thr_tiler_t, order=(0, 1))
 
-    grid_dim = [cute.size(gA, mode=[1]), cute.size(gA, mode=[2]), 1]
+    grid_dim = [cute.size(gA, mode=[2]), cute.size(gA, mode=[1]), 1]
     block_dim = [cute.size(thr_tiler), 1, 1]
 
     if VERBOSE:
@@ -186,8 +211,15 @@ def transpose_naive(
         print(f"block_dim: {block_dim}")
         print(f"thr_layout: {thr_layout}")
 
-    transpose_naive_kernel(gA, gB, gCrd, thr_layout, A.shape).launch(
-        grid=grid_dim, block=block_dim, smem=0, stream=stream
+    transpose_naive_kernel(
+        gA,
+        gB,
+        gCrd,
+        thr_layout,
+        A.shape,
+    ).launch(
+        grid=grid_dim,
+        block=block_dim,
     )
 
 
@@ -195,15 +227,14 @@ def transpose_naive(
 def transpose_smem(
     A: cute.Tensor,
     B: cute.Tensor,
-    stream: cuda.CUstream,
-    copy_bits: cutlass.Constexpr = 128,
-    swizzle: cutlass.Constexpr = True,
+    padding: cutlass.Constexpr = False,
+    swizzle: cutlass.Constexpr = False,
+    coalesce_read: cutlass.Constexpr = False,
 ):
-    # War. For output matrix B, we define a column-major layout (M,N):(1,M)
-    B = cute.make_tensor(B.iterator, cute.make_layout(B.shape, stride=(1, B.shape[0])))
-
     dtype = A.element_type
-    vl = copy_bits // dtype.width
+
+    # For output matrix B, we define a column-major layout (M,N):(1,M)
+    B = cute.make_tensor(B.iterator, cute.make_layout(B.shape, stride=(1, B.shape[0])))
 
     a_major_mode = utils.LayoutEnum.from_tensor(A)
     b_major_mode = utils.LayoutEnum.from_tensor(B)
@@ -218,36 +249,58 @@ def transpose_smem(
     Crd = cute.make_identity_tensor(A.shape)
     gCrd = cute.tiled_divide(Crd, cta_tiler)
 
-    thr_layout_a_coalesced = cute.make_ordered_layout(thr_tiler, order=(1, 0))
-    thr_layout_b_coalesced = cute.make_ordered_layout(thr_tiler, order=(0, 1))
+    # Define the thread layout and smem layout
+    # 1. To avoid uncloalesced GMEM access for both A and B (which is the key reason to use SMEM).
+    #    We define two thread layouts for A(row-major) and B(col-major).
+    # 2. Two options here when using smem for transpose:
+    #    1) Load A -> transpose -> Store SMEM -> Load SMEM -> Store B
+    #       The STS will be uncoalesced (i.e., bank conflict when writing SMEM)
+    #    2) Load A -> Store SMEM -> Load SMEM -> transpose -> Store B
+    #       The LDS will be uncoalesced (i.e., bank conflict when loading SMEM)
+    #    The uncoalesced SMEM access is less harmful than uncoalesced GMEM access.
+    # 3. To further optimize, we can apply swizzle or padding to avoid bank conflict.
 
-    smem_layout_a_coalesced = cute.make_ordered_layout(cta_tiler, order=(1, 0))
-    smem_layout_b_coalesced = cute.make_ordered_layout(cta_tiler, order=(0, 1))
-    smem_layout_a_swizzled, smem_layout_b_swizzled = None, None
+    thr_layout_a = cute.make_ordered_layout(thr_tiler, order=(1, 0))
+    thr_layout_b = cute.make_ordered_layout(thr_tiler_t, order=(0, 1))
 
     if cutlass.const_expr(swizzle):
-        m = math.log(1, 2)
-        b = math.log(32 * 32 / dtype.width, 2) - m  # 32 is bank number
-        s = math.log(cta_tiler[1], 2) - m
-        swizzle_atom = cute.make_swizzle(b, m, s)
-        smem_layout_a_swizzled = cute.make_composed_layout(swizzle_atom, 0, smem_layout_a_coalesced)
-        smem_layout_b_swizzled = cute.composition(smem_layout_a_swizzled, smem_layout_b_coalesced)
-        # R=lhs(rhs(c))
-
-    # Here we row-major coalesced access for A and column-major coalesced access for B
-    # Applied for both shared memory and thread-level layouts
-    thr_layout_a = thr_layout_a_coalesced
-    thr_layout_b = thr_layout_b_coalesced
-    if cutlass.const_expr(swizzle):
-        smem_layout_a = smem_layout_a_swizzled
-        smem_layout_b = smem_layout_b_swizzled
+        swizzle = cute.make_swizzle(*get_swizzle_bms(dtype))
+        smem_layout_swizzled = cute.make_composed_layout(
+            swizzle, 0, cute.make_layout(cta_tiler, stride=(cta_tiler[1], 1))
+        )
+    elif cutlass.const_expr(padding):
+        smem_layout_padded = cute.make_layout(cta_tiler, stride=(cta_tiler[1] + 1, 1))
+    elif cutlass.const_expr(coalesce_read):
+        smem_layout_read_coalesced = cute.make_layout(cta_tiler, stride=(cta_tiler[1], 1))
     else:
-        smem_layout_a = smem_layout_a_coalesced
-        smem_layout_b = smem_layout_b_coalesced
+        smem_layout_write_coalesced = cute.make_layout(
+            cta_tiler, stride=(1, cta_tiler[0])
+        )
+    # Here the smem layout is essentially option 1) or 2) mentioned above
 
-    grid_dim = [cute.size(gA, mode=[1]), cute.size(gA, mode=[2]), 1]
+    if cutlass.const_expr(swizzle):
+        smem_layout = smem_layout_swizzled
+    elif cutlass.const_expr(padding):
+        smem_layout = smem_layout_padded
+    elif cutlass.const_expr(coalesce_read):
+        smem_layout = smem_layout_read_coalesced
+    else:
+        smem_layout = smem_layout_write_coalesced
+
+    copy_atom_a = cute.make_copy_atom(
+        nvgpu.cpasync.CopyG2SOp(cache_mode=nvgpu.cpasync.LoadCacheMode.NONE),
+        dtype,
+        num_bits_per_copy=dtype.width,
+    )
+    copy_atom_b = cute.make_copy_atom(
+        nvgpu.CopyUniversalOp(),
+        dtype,
+        num_bits_per_copy=dtype.width,
+    )
+
+    grid_dim = [cute.size(gA, mode=[2]), cute.size(gA, mode=[1]), 1]
     block_dim = [cute.size(thr_tiler), 1, 1]
-    smem_size = cute.cosize(smem_layout_a) * dtype.width // 8
+    smem_size = cute.cosize(smem_layout) * dtype.width // 8
 
     if VERBOSE:
         print(f"A: {A}")
@@ -256,102 +309,139 @@ def transpose_smem(
         print(f"gB: {gB}")
         print(f"grid_dim: {grid_dim}")
         print(f"block_dim: {block_dim}")
-        print(f"smem_layout_a: {smem_layout_a}")
-        print(f"smem_layout_b: {smem_layout_b}")
+        print(f"smem_layout: {smem_layout}")
         print(f"thr_layout_a: {thr_layout_a}")
         print(f"thr_layout_b: {thr_layout_b}")
+        print(f"copy_atom_a: {copy_atom_a}")
+        print(f"copy_atom_b: {copy_atom_b}")
 
     transpose_smem_kernel(
-        gA, gB, gCrd, thr_layout_a, thr_layout_b, smem_layout_a, smem_layout_b, A.shape
-    ).launch(grid=grid_dim, block=block_dim, smem=smem_size, stream=stream)
+        gA,
+        gB,
+        gCrd,
+        thr_layout_a,
+        thr_layout_b,
+        smem_layout,
+        copy_atom_a,
+        copy_atom_b,
+        A.shape,
+    ).launch(
+        grid=grid_dim,
+        block=block_dim,
+        smem=smem_size,
+    )
+
+
+@cute.jit
+def transpose_tma():
+    pass
 
 
 def run_transpose(
-    impl: str,
     M: int,
     N: int,
     dtype: cutlass.Numeric = cutlass.Float32,
-    warmup_iterations: int = 10,
+    warmup_iterations: int = 5,
     iterations: int = 100,
     dynamic_layout: bool = False,
     skip_verify: bool = False,
 ):
-    print(f"Running transpose with M={M}, N={N}, dtype={dtype}, impl={impl}")
+    print(f"Running transpose with M={M}, N={N}, dtype={dtype}")
 
     torch_stream = torch.cuda.Stream()
     current_stream = cuda.CUstream(torch_stream.cuda_stream)
 
     torch_dtype = cutlass_torch.dtype(dtype)
 
-    kernel = None
-    kwargs = {}
-    if impl == "naive":
-        kernel = transpose_naive
-    elif impl == "smem":
-        kernel = transpose_smem
-    elif impl == "smem-swizzle":
-        kernel = transpose_smem
-        kwargs = {"swizzle": True}
-    else:
-        raise ValueError(f"Unsupported impl: {impl}")
-
     def _tensor_generator(return_torch=False):
-        a = torch.arange(M * N).view(M, N).to(dtype=torch_dtype).to("cuda")
-        b = torch.empty((M, N)).to(dtype=torch_dtype).to("cuda")
+        a_torch = torch.arange(M * N).view(M, N).to(dtype=torch_dtype).to("cuda")
+        b_torch = torch.empty((M, N)).to(dtype=torch_dtype).to("cuda")
 
-        a_tensor = from_dlpack(a) if not dynamic_layout else from_dlpack(a).mark_layout_dynamic()
-        b_tensor = from_dlpack(b) if not dynamic_layout else from_dlpack(b).mark_layout_dynamic()
+        a_cute = (
+            from_dlpack(a_torch)
+            if not dynamic_layout
+            else from_dlpack(a_torch).mark_layout_dynamic()
+        )
+        b_cute = (
+            from_dlpack(b_torch)
+            if not dynamic_layout
+            else from_dlpack(b_torch).mark_layout_dynamic()
+        )
 
         if return_torch:
-            return a_tensor, b_tensor, a, b
+            return a_cute, b_cute, a_torch, b_torch
 
-        return a_tensor, b_tensor
+        return a_cute, b_cute
+
+    kernels = {
+        "naive-coalesce-read": partial(transpose_naive, coalesce_read=True),
+        "naive-coalesce-write": partial(transpose_naive, coalesce_read=False),
+        "smem-coalesce-read": partial(transpose_smem, coalesce_read=True),
+        "smem-coalesce-write": partial(transpose_smem, coalesce_read=False),
+        "smem-padding": partial(transpose_smem, padding=True),
+        "smem-swizzle": partial(transpose_smem, swizzle=True),
+    }
 
     if not skip_verify:
-        _a_tensor, _b_tensor, _a, _b = _tensor_generator(True)
-        kernel(_a_tensor, _b_tensor, current_stream, **kwargs)
-        print(_a, "\n", _b.reshape(N, M))
-        torch.testing.assert_close(_a.T, _b.reshape(N, M))
-        print("Transpose correctness check passed.")
+        for kernel_name, kernel in kernels.items():
+            try:
+                _a_cute, _b_cute, _a_torch, _b_torch = _tensor_generator(True)
+                kernel(_a_cute, _b_cute)
+                torch.testing.assert_close(
+                    _a_torch.transpose(0, 1), _b_torch.reshape(N, M)
+                )
+                print(f"Kernel {kernel_name} verification passed.")
+            except Exception as e:
+                print(f"Kernel {kernel_name} verification failed: {e}")
+                print(_a_torch, _b_torch)
     else:
-        print("Transpose correctness check skipped.")
+        print("Transpose correctness varification skipped.")
 
-    # Compile
-    compile_tic = time.perf_counter()
-    transpose_func = cute.compile(kernel, *_tensor_generator(), current_stream, **kwargs)
-    print(f"Kernel compiled in {time.perf_counter() - compile_tic:.4f} seconds")
-
-    # Benchmarking
-    torch.cuda.empty_cache()
     workspace_bytes = M * N * dtype.width // 8
-    workspace_count = testing.get_workspace_count(workspace_bytes, warmup_iterations, iterations)
-    workspace_generator = lambda: testing.JitArguments(*_tensor_generator(), current_stream)
-
-    average_kernel_time_us = testing.benchmark(
-        transpose_func,
-        workspace_generator=workspace_generator,
-        workspace_count=workspace_count,
-        warmup_iterations=warmup_iterations,
-        iterations=iterations,
-        stream=current_stream,
-        use_cuda_graphs=False,
+    workspace_count = testing.get_workspace_count(
+        workspace_bytes, warmup_iterations, iterations
     )
+    workspace_generator = lambda: testing.JitArguments(*_tensor_generator())
 
-    print(f"Kernel execution time: {average_kernel_time_us / 1e3:.4f} ms")
-    print(
-        f"Achieved memory throughput: {(2 * M * N * dtype.width // 8) / (average_kernel_time_us / 1e6) / 1e9:.2f} GB/s"
-    )
+    for kernel_name, kernel in kernels.items():
+        compile_tic = time.perf_counter()
+        transpose_func = cute.compile(kernel, *_tensor_generator())
+        print(
+            f"Kernel {kernel_name} compiled in {time.perf_counter() - compile_tic:.4f} seconds"
+        )
+
+        # Benchmarking
+        torch.cuda.empty_cache()
+        average_kernel_time_us = testing.benchmark(
+            transpose_func,
+            workspace_generator=workspace_generator,
+            workspace_count=workspace_count,
+            warmup_iterations=warmup_iterations,
+            iterations=iterations,
+            stream=current_stream,
+        )
+
+        average_kernel_time_ms = average_kernel_time_us / 1e3
+        dram_throughput_gb_s = (
+            (2 * M * N * dtype.width // 8)
+            / (average_kernel_time_ms / 1e3)
+            / 1024
+            / 1024
+            / 1024
+        )
+        print(
+            f"Kernel {kernel.__name__} average execution time: {average_kernel_time_ms:.3f} ms"
+        )
+        print(f"Achieved memory throughput: {dram_throughput_gb_s:.2f} GB/s")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="example of elementwise ops to demonstrate the numpy/pytorch as input for kernels"
     )
-    parser.add_argument(
-        "--impl", type=str, choices=["naive", "smem", "smem-swizzle", "tma"], default="naive"
-    )
-    parser.add_argument("--M", "-M", default=1024, type=int)
-    parser.add_argument("--N", "-N", default=1024, type=int)
+
+    parser.add_argument("--M", "-M", default=128, type=int)
+    parser.add_argument("--N", "-N", default=256, type=int)
     parser.add_argument("--dtype", default="int32", type=str)
     parser.add_argument("--warmup-iterations", default=5, type=int)
     parser.add_argument("--iterations", default=30, type=int)
@@ -366,7 +456,6 @@ if __name__ == "__main__":
     VERBOSE = args.verbose
 
     run_transpose(
-        args.impl,
         args.M,
         args.N,
         dtype=get_cutlass_dtype(args.dtype),

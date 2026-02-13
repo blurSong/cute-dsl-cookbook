@@ -73,7 +73,7 @@ import cutlass.cute.testing as testing
 from cutlass.cute.runtime import from_dlpack
 from cutlass.utils import LayoutEnum
 
-from utils import check_cuda, benchmark_torch
+from utils import check_cuda, benchmark_torch, make_rasterized_grid, derasterize
 
 VERBOSE = True
 LOG = "[CuTe Info]"
@@ -81,6 +81,7 @@ LOG = "[CuTe Info]"
 # GLOBAL ================================================
 # DATA TYPES --------------------------------------------
 gemm_dtype = cutlass.Float32
+l2_size = torch.cuda.get_device_properties(torch.cuda.current_device()).L2_cache_size
 # SGEMM CONFIGURATIONS ----------------------------------
 num_stages = 3
 threads = 256
@@ -160,8 +161,7 @@ def make_tiled_copy_AB(
 def make_tiled_copy_C(
     major_mode: LayoutEnum,
 ):
-    """Make G2S tiled copy A and B
-    """
+    """Make G2S tiled copy A and B"""
     if major_mode == LayoutEnum.ROW_MAJOR:
         order = (1, 0)
         thr_tiler_1 = tile_n // vl
@@ -196,12 +196,18 @@ def sgemm_kernel(
     tiled_copy_B: cute.TiledCopy,
     tiled_copy_C: cute.TiledCopy,
     tiled_warp_mma: cute.TiledMma,
+    raster: cutlass.Constexpr = 1,
     epilogue_op: cutlass.Constexpr = lambda x: x,
 ):
     thr_idx = cute.arch.thread_idx()[0]
     blk_idx, blk_idy = cute.arch.block_idx()[:2]
     wrp_idx = cute.arch.warp_idx()
     lne_idx = cute.arch.lane_idx()
+
+    # blk_idx, blk_idy = derasterize(blk_idx, blk_idy, raster)
+    # grid_dim = cute.ceil_div(C.shape, (tile_m, tile_n))
+    # if blk_idx >= grid_dim[0] or blk_idy >= grid_dim[1]:
+    #     pass
 
     cta_coord = (blk_idx, blk_idy, None)
     # Here None means 'all' for cute slicing
@@ -419,7 +425,7 @@ def sgemm_kernel(
 
     # Prefetch SMEM->RMEM for the first MMA tile
     smem_pipe_read = cutlass.Int32(0)
-    smem_pipe_write = cutlass.Int32(num_stages - 1)
+    smem_pipe_write = cutlass.Int32(k_tile_index_smem)
     gmem_pipe_read = k_tile_index_gmem
 
     tCsA_p = tCsA[None, None, None, None, smem_pipe_read]
@@ -503,11 +509,11 @@ def sgemm_kernel(
             coord_s = (None, None, None, smem_pipe_write)
             cute.copy(tiled_copy_A, tAgA[coord_g], tAsA[coord_s], pred=tAprdA)
             cute.copy(tiled_copy_B, tBgB[coord_g], tBsB[coord_s], pred=tBprdB)
-            cute.arch.cp_async_commit_group()
             # Update meta pointers of gmem/smem pipes
             gmem_pipe_read += 1
             smem_pipe_write = (smem_pipe_write + 1) % num_stages
-        # Always move smem_pipe_read ptr to fethch SMEM->RMEM
+        # Always commit new cp.async and always move smem_pipe_read ptr
+        cute.arch.cp_async_commit_group()
         smem_pipe_read = (smem_pipe_read + 1) % num_stages
         for k_frag_index in cutlass.range(num_k_frags, unroll_full=True):
             # - If the inner loop reaches the last fragment, we need to
@@ -546,6 +552,7 @@ def sgemm(
     B: cute.Tensor,
     C: cute.Tensor,
     epilogue_op: cutlass.Constexpr = lambda x: x,
+    rasterize_l2: cutlass.Constexpr = False,
 ):
     # num_stages for overlapping loading and computation
     # Each cta handles a tile of size (tile_m, K)@A and (tile_n, K)@B produce (tile_m, tile_n)@C
@@ -604,7 +611,10 @@ def sgemm(
         permutation_mnk=(permutation_m, permutation_n, None),
     )
 
+    raster = 1
     grid_dim = [*cute.ceil_div(C.shape, (tile_m, tile_n)), 1]
+    # if rasterize_l2:
+    #     raster, grid_dim = make_rasterized_grid(C.shape[0], C.shape[1], tile_m, tile_n)
     block_dim = [threads, 1, 1]
 
     if cutlass.const_expr(VERBOSE):
@@ -634,6 +644,7 @@ def sgemm(
         tiled_copy_B,
         tiled_copy_C,
         tiled_warp_mma,
+        raster,
         epilogue_op,
     ).launch(grid=grid_dim, block=block_dim, smem=smem_size)
 
@@ -643,6 +654,7 @@ def run_sgemm(
     N: int,
     K: int,
     blas: str = "tn",
+    rasterize_l2: bool = False,
     skip_verify: bool = False,
     dynamic_layout: bool = False,
     warmup_iterations: int = 10,
@@ -694,7 +706,7 @@ def run_sgemm(
 
     # Verify
     if not skip_verify:
-        sgemm(a_tensor, b_tensor, c_tensor)
+        sgemm(a_tensor, b_tensor, c_tensor, rasterize_l2=rasterize_l2)
         torch.cuda.synchronize()
         c_torch_ref = torch.einsum("mk,nk->mn", a_torch, b_torch)
         torch.testing.assert_close(c_torch.cpu(), c_torch_ref.cpu(), atol=1e-03, rtol=1e-05)
@@ -704,7 +716,7 @@ def run_sgemm(
 
     # Compile
     compile_tic = time.perf_counter()
-    sgemm_compiled = cute.compile(sgemm, a_tensor, b_tensor, c_tensor)
+    sgemm_compiled = cute.compile(sgemm, a_tensor, b_tensor, c_tensor, rasterize_l2=rasterize_l2)
     print(f"Kernel compiled in {time.perf_counter() - compile_tic:.4f} seconds")
 
     # Benchmarking
@@ -749,6 +761,7 @@ if __name__ == "__main__":
     parser.add_argument("--N", "-N", default=1024, type=int)
     parser.add_argument("--K", "-K", default=1024, type=int)
     parser.add_argument("--blas", type=str, default="tn", choices=["tn", "tt", "nn", "nt"])
+    parser.add_argument("--rasterize-l2", action="store_true")
     parser.add_argument("--warmup-iterations", default=10, type=int)
     parser.add_argument("--iterations", default=100, type=int)
     parser.add_argument("--skip-verify", action="store_true")
@@ -765,6 +778,7 @@ if __name__ == "__main__":
         args.N,
         args.K,
         blas=args.blas,
+        rasterize_l2=args.rasterize_l2,
         skip_verify=args.skip_verify,
         dynamic_layout=args.dynamic_layout,
         warmup_iterations=args.warmup_iterations,

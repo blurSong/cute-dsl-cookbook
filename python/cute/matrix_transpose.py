@@ -84,7 +84,7 @@ def transpose_naive_kernel(
 
     tArA = cute.make_rmem_tensor_like(tAgA)
 
-    if VERBOSE:
+    if cutlass.const_expr(VERBOSE):
         print(f"gA: {gA}")
         print(f"gB: {gB}")
         print(f"tAgA: {tAgA}")
@@ -134,7 +134,7 @@ def transpose_smem_kernel(
     tAsA = cute.local_partition(sA, thr_layout_a, thr_x)
     tBsB = cute.local_partition(sB, thr_layout_b, thr_x)
 
-    if VERBOSE:
+    if cutlass.const_expr(VERBOSE):
         print(f"gA: {gA}")
         print(f"gB: {gB}")
         print(f"tAgA: {tAgA}")
@@ -203,7 +203,7 @@ def transpose_naive(
     grid_dim = [cute.size(gA, mode=[2]), cute.size(gA, mode=[1]), 1]
     block_dim = [cute.size(thr_tiler), 1, 1]
 
-    if VERBOSE:
+    if cutlass.const_expr(VERBOSE):
         print(f"gA: {gA}")
         print(f"gB: {gB}")
         print(f"gCrd: {gCrd}")
@@ -302,7 +302,7 @@ def transpose_smem(
     block_dim = [cute.size(thr_tiler), 1, 1]
     smem_size = cute.cosize(smem_layout) * dtype.width // 8
 
-    if VERBOSE:
+    if cutlass.const_expr(VERBOSE):
         print(f"A: {A}")
         print(f"B: {B}")
         print(f"gA: {gA}")

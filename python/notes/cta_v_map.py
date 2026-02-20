@@ -3,6 +3,7 @@ import cutlass.cute as cute
 import cutlass.torch as cutlass_torch
 from cutlass.utils import print_latex
 
+cta_tiler = (64, 128)
 
 @cute.jit
 def test_cta_v_map(
@@ -10,7 +11,6 @@ def test_cta_v_map(
 ):
     """Test the computation of CTA V Map in cpasync.make_tiled_tma_atom
     """
-    cta_tiler = (64, 128)
     cta_v_map = cute.composition(cute.make_identity_layout(gmem_tensor.shape), cta_tiler)
     print("CTA V Map:", cta_v_map)
     # print_latex(cta_v_map)

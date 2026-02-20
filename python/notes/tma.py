@@ -7,6 +7,12 @@ from cutlass.cute.nvgpu.cpasync import (
     make_tiled_tma_atom,
     tma_partition,
 )
+from cutlass.cute.nvgpu.tcgen05 import (
+    SmemLayoutAtomKind,
+    make_smem_layout_atom,
+    tile_to_mma_shape,
+)
+from cutlass.utils import print_latex
 
 import cutlass
 from cutlass import cute
@@ -54,33 +60,64 @@ def tma_load_store_kernel(
 
 
 @cute.jit
-def tma_bulk(A: cute.Tensor, B: cute.Tensor):
+def tma_load_store_test(
+    A: cute.Tensor,
+    B: cute.Tensor,
+):
     tma_g2s = cute.make_copy_atom(cpasync.CopyBulkG2SOp(), cutlass.Float32)
     tma_s2g = cute.make_copy_atom(cpasync.CopyBulkS2GOp(), cutlass.Float32)
 
-    tma_load_store_kernel(A, B, tma_g2s, tma_s2g).launch(grid=[1, 1, 1], block=[32, 1, 1])
+    tma_load_store_kernel(A, B, tma_g2s, tma_s2g).launch(
+        grid=[1, 1, 1], block=[32, 1, 1]
+    )
+
+
+@cute.jit
+def tma_box_test(
+    A: cute.Tensor,
+    B: cute.Tensor,
+    cta_tiler: cutlass.Constexpr[cute.Shape],
+    smem_layout_atom_kind: cutlass.Constexpr[SmemLayoutAtomKind],
+):
+    smem_layout_atom = make_smem_layout_atom(
+        smem_layout_atom_kind,
+        A.element_type,
+    )  # The `atom` is essentially a layout or composed layout.
+    tiled_smem_layout = cute.tile_to_shape(
+        smem_layout_atom, cta_tiler, order=(0, 1)
+    )  # With order=(1, 2), basically we say the swizzle atom is first stacked along M, then K
+    tma_atom, tma_tensor = make_tiled_tma_atom(
+        CopyBulkTensorTileG2SOp(),
+        A,
+        tiled_smem_layout,  # Destination SMEM layout for 1 DMA_Stage, ((Mma_M, Mma_K), NumMma_M, NumMma_K)
+        cta_tiler,  # cta_tiler. I.e.m, the TMA box shape, it's cosize must match the cosize of the destination smem layout
+    )
+
+    # print(f"A Tensor: {A}")
+    # print(f"Smem Layout Atom: {smem_layout_atom}")
+    # print(f"Tiled SMEM Layout: {tiled_smem_layout}")
+    # print(f"TMA Atom: {tma_atom}")
+    # print(f"TMA Atom SMEM Layout: {tma_atom.smem_layout}")
+    # print(f"TMA Tensor: {tma_tensor}")
+
+    print_latex(tiled_smem_layout)
 
 
 def run_tests():
+    cta_tiler = (64, 64)
 
-    A = (
-        torch.arange(128 * 128, dtype=torch.float32, device="cuda")
-        .reshape(128, 128)
-        .transpose(0, 1)
-    )
-    B = torch.zeros((128, 128), dtype=torch.float32, device="cuda").transpose(0, 1)
+    A = torch.arange(128 * 256, dtype=torch.float16, device="cuda").reshape(128, 256)
+    B = torch.zeros_like(A)
     A_cute = cute.runtime.from_dlpack(A, assumed_align=16)
     B_cute = cute.runtime.from_dlpack(B, assumed_align=16)
 
-    tma_bulk_compiled = cute.compile(tma_bulk, A_cute, B_cute, options="--keep-ptx")
-    tma_bulk_compiled(A_cute, B_cute)
+    smem_layout_atom_kind = SmemLayoutAtomKind.K_SW128
 
-    print("Input A (first 8x8):")
-    print(A[:8, :8].cpu())
-    print("\nOutput B (first 8x8):")
-    print(B[:8, :8].cpu())
+    tma_box_test(A_cute, B_cute, cta_tiler, smem_layout_atom_kind)
+    # tma_load_store_test(A_cute, B_cute, cta_tiler)
 
-    # 验证结果
+    # tma_load_store_compiled = cute.compile(tma_load_store_test, A_cute, B_cute, options="--keep-ptx")
+
     if torch.allclose(A.cpu(), B.cpu()):
         print("\n✓ Bulk copy test PASSED!")
     else:
@@ -94,9 +131,9 @@ def main():
     print(f"Compute Capability: {capability[0]}.{capability[1]}")
 
     if capability[0] < 9:
-        print("\nWARNING: TMA requires SM90+ (Hopper architecture)")
-    else:
-        run_tests()
+        print("\nWARNING: TMA requires SM90+ (Hopper architecture)\n")
+
+    run_tests()
 
 
 if __name__ == "__main__":

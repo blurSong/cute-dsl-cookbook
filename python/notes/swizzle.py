@@ -89,7 +89,7 @@ def print_smem_layout(
         element_type,
     )
     tiled_smem_layout = cute.tile_to_shape(smem_layout_atom, smem_shape, order=order)
-    # With order=(1, 2), basically we say the swizzle atom is first stacked along M, then K
+    # With order=(0, 1), basically we say the swizzle atom is first stacked along M, then K
     print_latex(tiled_smem_layout)
 
 
@@ -111,7 +111,7 @@ def test_print_smem_layout():
     smem_shape = (128, 128)
     elem_type = cutlass.Float16
     smem_layout_atom_kind = SmemLayoutAtomKind.K_SW32
-    order = (1, 2)
+    order = (0, 1)
     print_smem_layout(elem_type, smem_layout_atom_kind, smem_shape, order)
 
 

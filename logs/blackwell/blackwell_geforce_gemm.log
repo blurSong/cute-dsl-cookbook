@@ -1,0 +1,49 @@
+$ python dense_gemm.py
+Running Blackwell Geforce Dense GEMM with:
+mnkl: (1024, 2048, 4096, 1)
+A dtype: Float16, B dtype: Float16, C dtype: Float16, Acc dtype: Float32
+Matrix majors - A: k, B: k, C: n
+Tile Shape: (64, 64, 64)
+Tolerance: 0.1
+Warmup iterations: 0
+Iterations: 1
+Skip reference checking: False
+Use cold L2: False
+max_active_clusters 84
+DenseGemmBlackwellGeforce:  A tensor<ptr<f16, gmem, align<16>> o (?,?,?):(1,?,?)>
+DenseGemmBlackwellGeforce:  B tensor<ptr<f16, gmem, align<16>> o (?,?,?):(1,?,?)>
+DenseGemmBlackwellGeforce:  C tensor<ptr<f16, gmem, align<16>> o (?,?,?):(1,?,?)>
+DenseGemmBlackwellGeforce:  grid (1, 1, Int32(?))
+DenseGemmBlackwellGeforce:  block 160
+DenseGemmBlackwellGeforce:  cluster (1, 1, 1)
+DenseGemmBlackwellGeforce:  tile_sched_params <cutlass.utils.static_persistent_tile_scheduler.PersistentTileSchedulerParams object at 0x7d82ce5ed190>
+DenseGemmBlackwellGeforce:  smem_layout_A S<3,4,3> o 0 o ((64,1),(8,8),(1,4)):((1,0),(64,512),(0,4096))
+DenseGemmBlackwellGeforce:  smem_layout_B S<3,4,3> o 0 o ((64,1),(8,8),(1,4)):((1,0),(64,512),(0,4096))
+DenseGemmBlackwellGeforce:  smem_layout_C S<3,4,3> o 0 o ((64,1),(8,4),(1,8)):((1,0),(64,512),(0,2048))
+DenseGemmBlackwellGeforce:  tma_atom_A Copy Atom
+  ThrID:         1:0
+  TV Layout Src: (1,4096):(0,1)
+  TV Layout Dst: (1,4096):(0,1)
+  Value type:    f16
+DenseGemmBlackwellGeforce:  tma_atom_B Copy Atom
+  ThrID:         1:0
+  TV Layout Src: (1,4096):(0,1)
+  TV Layout Dst: (1,4096):(0,1)
+  Value type:    f16
+DenseGemmBlackwellGeforce:  tma_atom_C Copy Atom
+  ThrID:         1:0
+  TV Layout Src: (1,2048):(0,1)
+  TV Layout Dst: (1,2048):(0,1)
+  Value type:    f16
+DenseGemmBlackwellGeforce:  tma_tensor_A tensor<(0,0,0) o (?,?,?):(1@0,1@1,1@2)>
+DenseGemmBlackwellGeforce:  tma_tensor_B tensor<(0,0,0) o (?,?,?):(1@0,1@1,1@2)>
+DenseGemmBlackwellGeforce:  tma_tensor_C tensor<(0,0,0) o (?,?,?):(1@0,1@1,1@2)>
+DenseGemmBlackwellGeforce:  tiled_mma Tiled MMA
+  Thr Layout VMNK: (32,2,2,1):(1,32,64,0)
+  Permutation MNK: (32:1,32:1,16:1)
+MMA Atom
+  ThrID:           32:1
+  Shape MNK:       (16,8,16)
+  TV Layout A:     ((4,8),(2,2,2)):((32,1),(16,8,128))
+  TV Layout B:     ((4,8),(2,2)):((16,1),(8,64))
+  TV Layout C:     ((4,8),(2,2)):((32,1),(16,8))

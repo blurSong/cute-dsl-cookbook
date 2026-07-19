@@ -1,0 +1,40 @@
+$ python hgemm_sm120.py --verbose
+Running SM120 hgemm with M=1024, N=2048, K=4096, L=1, BLAS TN.
+[CuTe Info] GemmConfig: {'max_active_clusters': 84}
+[CuTe Info] A tensor<ptr<f16, gmem, align<16>> o (1024,4096,1):(4096,1,1)>
+[CuTe Info] B tensor<ptr<f16, gmem, align<16>> o (2048,4096,1):(4096,1,1)>
+[CuTe Info] C tensor<ptr<f16, gmem, align<16>> o (1024,2048,1):(2048,1,1)>
+[CuTe Info] grid (1, 1, 84)
+[CuTe Info] block [160, 1, 1]
+[CuTe Info] cluster (1, 1, 1)
+[CuTe Info] tile_sched_params <cutlass.utils.static_persistent_tile_scheduler.PersistentTileSchedulerParams object at 0x7ea46015b800>
+[CuTe Info] smem_layout_A S<3,4,3> o 0 o ((8,16),(64,1),(1,2)):((64,512),(1,0),(0,8192))
+[CuTe Info] smem_layout_B S<3,4,3> o 0 o ((8,16),(64,1),(1,2)):((64,512),(1,0),(0,8192))
+[CuTe Info] smem_layout_C S<2,4,3> o 0 o ((8,8),(32,1),(1,8)):((32,256),(1,0),(0,2048))
+[CuTe Info] tma_atom_A Copy Atom
+  ThrID:         1:0
+  TV Layout Src: (1,8192):(0,1)
+  TV Layout Dst: (1,8192):(0,1)
+  Value type:    f16
+[CuTe Info] tma_atom_B Copy Atom
+  ThrID:         1:0
+  TV Layout Src: (1,8192):(0,1)
+  TV Layout Dst: (1,8192):(0,1)
+  Value type:    f16
+[CuTe Info] tma_atom_C Copy Atom
+  ThrID:         1:0
+  TV Layout Src: (1,2048):(0,1)
+  TV Layout Dst: (1,2048):(0,1)
+  Value type:    f16
+[CuTe Info] tma_tensor_A tensor<(0,0) o (1024,4096,1):(1@1,1@0,0)>
+[CuTe Info] tma_tensor_B tensor<(0,0) o (2048,4096,1):(1@1,1@0,0)>
+[CuTe Info] tma_tensor_C tensor<(0,0) o (1024,2048,1):(1@1,1@0,0)>
+[CuTe Info] tiled_mma Tiled MMA
+  Thr Layout VMNK: (32,2,2,1):(1,64,32,0)
+  Permutation MNK: (32:1,32:1,16:1)
+MMA Atom
+  ThrID:           32:1
+  Shape MNK:       (16,8,16)
+  TV Layout A:     ((4,8),(2,2,2)):((32,1),(16,8,128))
+  TV Layout B:     ((4,8),(2,2)):((16,1),(8,64))
+  TV Layout C:     ((4,8),(2,2)):((32,1),(16,8))

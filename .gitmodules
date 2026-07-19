@@ -1,0 +1,15 @@
+[submodule "tutorials/CUDA-PPT"]
+	path = tutorials/CUDA-PPT
+	url = https://github.com/MARD1NO/CUDA-PPT.git
+[submodule "tutorials/resource-stream"]
+	path = tutorials/resource-stream
+	url = https://github.com/gpu-mode/resource-stream.git
+[submodule "tutorials/lectures"]
+	path = tutorials/lectures
+	url = https://github.com/gpu-mode/lectures.git
+[submodule "tutorials/awesome-gemm"]
+	path = tutorials/awesome-gemm
+	url = https://github.com/yuninxia/awesome-gemm.git
+[submodule "agents/ptx-isa-markdown"]
+	path = agents/ptx-isa-markdown
+	url = https://github.com/technillogue/ptx-isa-markdown.git

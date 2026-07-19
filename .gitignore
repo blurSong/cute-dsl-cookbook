@@ -1,0 +1,5 @@
+__pycache__/
+_c/
+ncu/
+.venv
+scripts/sync-cutedsl-env

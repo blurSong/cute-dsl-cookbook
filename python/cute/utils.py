@@ -2,7 +2,7 @@ import torch
 import math
 import cutlass
 import cutlass.cute as cute
-from typing import Callable, List
+from typing import Callable
 from cutlass.base_dsl.typing import __STR_TO_DTYPE__
 
 VERBOSE = False

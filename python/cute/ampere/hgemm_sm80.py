@@ -40,7 +40,7 @@ import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import from_dlpack
 from cutlass.utils import LayoutEnum
 
-from utils import check_cuda, benchmark_torch
+from ..utils import check_cuda, benchmark_torch
 
 VERBOSE = False
 LOG = "[CuTe Info]"

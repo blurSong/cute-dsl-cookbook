@@ -39,7 +39,7 @@ import torch
 from cutlass.cute.nvgpu import cpasync, warp  # sm120 is not tcgen05
 from cutlass.cute.runtime import from_dlpack
 from cutlass.utils import LayoutEnum
-from utils import benchmark_torch, check_cuda
+from ..utils import benchmark_torch, check_cuda
 
 import cutlass
 
@@ -74,7 +74,6 @@ class GemmConfig:
 
 
 class Sm120HgemmKernel:
-
     def __init__(self, config: GemmConfig):
         # kernel
         self.sm_version = "sm_120"

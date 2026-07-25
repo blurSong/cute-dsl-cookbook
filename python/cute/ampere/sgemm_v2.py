@@ -73,7 +73,7 @@ import cutlass.cute.testing as testing
 from cutlass.cute.runtime import from_dlpack
 from cutlass.utils import LayoutEnum
 
-from utils import check_cuda, benchmark_torch, make_rasterized_grid, derasterize
+from ..utils import check_cuda, benchmark_torch, make_rasterized_grid, derasterize
 
 VERBOSE = True
 LOG = "[CuTe Info]"

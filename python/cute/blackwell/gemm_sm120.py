@@ -38,6 +38,7 @@ import cutlass.utils.hopper_helpers as sm90_utils
 import torch
 from cutlass.cute.nvgpu import cpasync, warp  # sm120 is not tcgen05
 from cutlass.utils import LayoutEnum
+from ..gemm_config import GemmConfigSm120
 from ..utils import (
     benchmark_torch,
     check_cuda,
@@ -53,38 +54,8 @@ VERBOSE = False
 LOG = "[CuTe Info]"
 
 
-class GemmConfig:
-    # DTYPES
-    a_dtype = cutlass.Float16
-    b_dtype = cutlass.Float16
-    c_dtype = cutlass.Float16
-    acc_dtype = cutlass.Float32
-    # CONFIGURATIONS
-    cluster_shape = (1, 1, 1)
-    cta_tiler_mnk = (128, 128, 64)
-    mma_inst_shape = (16, 8, 16)
-    mma_atom_shape = (2, 2, 1)
-    copy_bits = 128
-    bytes_alignment = 16
-    vla = copy_bits // a_dtype.width
-    vlb = copy_bits // b_dtype.width
-    max_active_clusters = 0
-
-    def check_sanity(self):
-        # PARAMETERS DERIVED
-        tile_m, tile_n, tile_k = self.cta_tiler_mnk
-        mma_inst_m, mma_inst_n, mma_inst_k = self.mma_inst_shape
-        mma_atom_m, mma_atom_n, mma_atom_k = self.mma_atom_shape
-        assert tile_m % (mma_atom_m * mma_inst_m) == 0
-        assert tile_n % (mma_atom_n * mma_inst_n) == 0
-        assert mma_atom_k == 1
-        assert tile_k % mma_inst_k == 0
-        assert self.bytes_alignment % self.vla == 0
-        assert self.bytes_alignment % self.vlb == 0
-
-
 class Sm120GemmKernel:
-    def __init__(self, config: GemmConfig):
+    def __init__(self, config: GemmConfigSm120):
         # kernel
         self.sm_version = "sm_120"
         self.gemm_dtype = config.gemm_dtype
@@ -454,11 +425,13 @@ def run_gemm(
     iterations: int = 100,
     skip_verify: bool = False,
     dynamic_layout: bool = False,
+    cluster_shape: Tuple[int, int, int] = (1, 1, 1),
 ):
 
     print("Running SM120 Dense GEMM with:")
     print(f"GEMM mnkl: {mnkl}")
     print(f"Tile mnk: {tile_shape_mnk}")
+    print(f"Cluster shape: {cluster_shape}")
     print(f"Dtype - A: {a_dtype}, B: {b_dtype}, C: {c_dtype}, Acc: {acc_dtype}")
     print(f"Matrix majors - A: {a_major}, B: {b_major}, C: {c_major}")
     print(f"Iterations: {warmup_iterations} warmup, {iterations} run")
@@ -466,14 +439,13 @@ def run_gemm(
 
     M, N, K, L = mnkl
 
-    config = GemmConfig()
-    config.a_dtype = a_dtype
-    config.b_dtype = b_dtype
-    config.c_dtype = c_dtype
-    config.acc_dtype = acc_dtype
-    config.cta_tiler_mnk = tile_shape_mnk
-    config.max_active_clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(
-        config.cluster_shape[0] * config.cluster_shape[1]
+    config = GemmConfigSm120(
+        a_dtype=a_dtype,
+        b_dtype=b_dtype,
+        c_dtype=c_dtype,
+        acc_dtype=acc_dtype,
+        cta_tiler_mnk=tile_shape_mnk,
+        cluster_shape=cluster_shape,
     )
 
     if VERBOSE:

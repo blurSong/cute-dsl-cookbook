@@ -26,20 +26,26 @@ Constraints:
 """
 
 import argparse
+from functools import partial
 import math
 import time
 from typing import List, Tuple, Type
 
 import cuda.bindings.driver as cuda
 import cutlass.cute as cute
-import cutlass.cute.testing as testing
-import cutlass.torch as cutlass_torch
+import cutlass.testing as testing
 import cutlass.utils.hopper_helpers as sm90_utils
 import torch
 from cutlass.cute.nvgpu import cpasync, warp  # sm120 is not tcgen05
-from cutlass.cute.runtime import from_dlpack
 from cutlass.utils import LayoutEnum
-from ..utils import benchmark_torch, check_cuda
+from ..utils import (
+    benchmark_torch,
+    check_cuda,
+    parse_comma_separated_ints,
+    str_to_cutlass_dtype,
+    generate_gemm_tensors,
+)
+
 
 import cutlass
 
@@ -48,32 +54,36 @@ LOG = "[CuTe Info]"
 
 
 class GemmConfig:
-    # DATA TYPES
-    gemm_dtype = cutlass.Float16
+    # DTYPES
+    a_dtype = cutlass.Float16
+    b_dtype = cutlass.Float16
+    c_dtype = cutlass.Float16
     acc_dtype = cutlass.Float32
-    # HGEMM CONFIGURATIONS
+    # CONFIGURATIONS
     cluster_shape = (1, 1, 1)
-    cta_tiler = (128, 128, 64)
+    cta_tiler_mnk = (128, 128, 64)
     mma_inst_shape = (16, 8, 16)
     mma_atom_shape = (2, 2, 1)
     copy_bits = 128
     bytes_alignment = 16
-    vl = copy_bits // gemm_dtype.width
+    vla = copy_bits // a_dtype.width
+    vlb = copy_bits // b_dtype.width
     max_active_clusters = 0
 
     def check_sanity(self):
         # PARAMETERS DERIVED
-        tile_m, tile_n, tile_k = self.cta_tiler
+        tile_m, tile_n, tile_k = self.cta_tiler_mnk
         mma_inst_m, mma_inst_n, mma_inst_k = self.mma_inst_shape
         mma_atom_m, mma_atom_n, mma_atom_k = self.mma_atom_shape
         assert tile_m % (mma_atom_m * mma_inst_m) == 0
         assert tile_n % (mma_atom_n * mma_inst_n) == 0
         assert mma_atom_k == 1
         assert tile_k % mma_inst_k == 0
-        assert self.bytes_alignment % self.vl == 0
+        assert self.bytes_alignment % self.vla == 0
+        assert self.bytes_alignment % self.vlb == 0
 
 
-class Sm120HgemmKernel:
+class Sm120GemmKernel:
     def __init__(self, config: GemmConfig):
         # kernel
         self.sm_version = "sm_120"
@@ -430,94 +440,105 @@ class Sm120HgemmKernel:
         )
 
 
-def run_hgemm(
-    M: int,
-    N: int,
-    K: int,
-    L: int = 1,
-    blas: str = "tn",
-    skip_verify: bool = False,
-    dynamic_layout: bool = False,
+def run_gemm(
+    mnkl: Tuple[int, int, int, int],
+    tile_shape_mnk: Tuple[int, int, int],
+    a_dtype: Type[cutlass.Numeric],
+    b_dtype: Type[cutlass.Numeric],
+    c_dtype: Type[cutlass.Numeric],
+    acc_dtype: Type[cutlass.Numeric],
+    a_major: str,
+    b_major: str,
+    c_major: str,
     warmup_iterations: int = 10,
     iterations: int = 100,
+    skip_verify: bool = False,
+    dynamic_layout: bool = False,
 ):
-    print(
-        "Running SM120 hgemm with M={}, N={}, K={}, L={}, BLAS {}.".format(M, N, K, L, blas.upper())
-    )
 
-    a_transpose, b_transpose = [t == "t" for t in blas]
+    print("Running SM120 Dense GEMM with:")
+    print(f"GEMM mnkl: {mnkl}")
+    print(f"Tile mnk: {tile_shape_mnk}")
+    print(f"Dtype - A: {a_dtype}, B: {b_dtype}, C: {c_dtype}, Acc: {acc_dtype}")
+    print(f"Matrix majors - A: {a_major}, B: {b_major}, C: {c_major}")
+    print(f"Iterations: {warmup_iterations} warmup, {iterations} run")
+    print(f"Skip verification: {skip_verify}")
+
+    M, N, K, L = mnkl
+
     config = GemmConfig()
-    config.check_sanity()
-    gemm_dtype = config.gemm_dtype
-    bytes_alignment = config.bytes_alignment
-
-    def tensor_generator(return_type: str = "all"):
-        assert return_type in ["all", "cute_only", "torch_only"]
-
-        a_torch_cpu = cutlass_torch.matrix(L, M, K, not a_transpose, gemm_dtype)
-        b_torch_cpu = cutlass_torch.matrix(L, N, K, b_transpose, gemm_dtype)
-        c_torch_cpu = cutlass_torch.matrix(
-            L, M, N, False, gemm_dtype, init_type=cutlass_torch.TensorInitType.SKIP
-        )
-
-        a_cute, a_torch = cutlass_torch.cute_tensor_like(
-            a_torch_cpu, gemm_dtype, dynamic_layout, bytes_alignment
-        )
-        b_cute, b_torch = cutlass_torch.cute_tensor_like(
-            b_torch_cpu, gemm_dtype, dynamic_layout, bytes_alignment
-        )
-        c_cute, c_torch = cutlass_torch.cute_tensor_like(
-            c_torch_cpu, gemm_dtype, dynamic_layout, bytes_alignment
-        )
-
-        if return_type == "torch_only":
-            return a_torch, b_torch, c_torch
-
-        if return_type == "cute_only":
-            return a_cute, b_cute, c_cute
-
-        return a_cute, b_cute, c_cute, a_torch, b_torch, c_torch
-
-    # Verification and compilation
-    a_cute, b_cute, c_cute, a_torch, b_torch, c_torch = tensor_generator()
-
-    # Update max_active_clusters
-    hardware_info = cutlass.utils.HardwareInfo()
-    config.max_active_clusters = hardware_info.get_max_active_clusters(
+    config.a_dtype = a_dtype
+    config.b_dtype = b_dtype
+    config.c_dtype = c_dtype
+    config.acc_dtype = acc_dtype
+    config.cta_tiler_mnk = tile_shape_mnk
+    config.max_active_clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(
         config.cluster_shape[0] * config.cluster_shape[1]
     )
 
     if VERBOSE:
         print(f"{LOG} GemmConfig: {config.__dict__}")
 
-    hgemm = Sm120HgemmKernel(config)
+    # Verification and compilation
+
+    gemm = Sm120GemmKernel(config)
+
+    general_tensor_generator = partial(
+        generate_gemm_tensors,
+        M,
+        N,
+        K,
+        L,
+        a_major,
+        b_major,
+        c_major,
+        a_dtype,
+        b_dtype,
+        c_dtype,
+        dynamic_layout,
+        config.bytes_alignment,
+    )
+
+    (
+        a_cute,
+        b_cute,
+        c_cute,
+        a_torch,
+        b_torch,
+        c_torch,
+    ) = general_tensor_generator(return_type="both")
 
     if not skip_verify:
-        hgemm(a_cute, b_cute, c_cute)
+        gemm(a_cute, b_cute, c_cute)
         torch.cuda.synchronize()
-        c_ref = torch.einsum(
+        c_ref_torch = torch.einsum(
             "mkl,nkl->mnl",
             a_torch.to(dtype=torch.float32),
             b_torch.to(dtype=torch.float32),
-        ).to(dtype=torch.float16)
-        torch.testing.assert_close(c_torch.cpu(), c_ref.cpu(), atol=1e-01, rtol=1e-03)
+        ).to(dtype=c_torch.dtype)
+        torch.testing.assert_close(c_torch.cpu(), c_ref_torch.cpu(), atol=1e-01, rtol=1e-03)
         print("Verification passed.")
     else:
         print("Verification skipped.")
 
-    compile_tic = time.perf_counter()
-    hgemm_compiled = cute.compile(hgemm, a_cute, b_cute, c_cute)
-    print(f"Kernel compiled time {time.perf_counter() - compile_tic:.4f} seconds")
+    tic = time.perf_counter()
+    gemm_compiled = cute.compile(gemm, a_cute, b_cute, c_cute)
+    print(f"Kernel compiled time {time.perf_counter() - tic:.4f} seconds")
 
     # benchmarking
-    workspace_bytes = (M * K + N * K + M * N) * 2 * L
+    workspace_bytes = (M * K * a_dtype.bytes + N * K * b_dtype.bytes + M * N * c_dtype.bytes) * L
     workspace_count = testing.get_workspace_count(workspace_bytes, warmup_iterations, iterations)
 
     def torch_workspace_generator():
-        return ["mkl,nkl->mnl", *tensor_generator("torch_only")[:2]]
+        return [
+            "mkl,nkl->mnl",
+            *general_tensor_generator(return_type="torch"),
+        ]
 
     def cute_workspace_generator():
-        return testing.JitArguments(*tensor_generator("cute_only"))
+        return cutlass.testing.JitArguments(
+            *general_tensor_generator(return_type="cute"),
+        )
 
     torch_avg_time_us = benchmark_torch(
         torch.einsum,
@@ -528,7 +549,7 @@ def run_hgemm(
     )
 
     cute_avg_time_us = testing.benchmark(
-        hgemm_compiled,
+        gemm_compiled,
         workspace_generator=cute_workspace_generator,
         workspace_count=workspace_count,
         warmup_iterations=warmup_iterations,
@@ -543,35 +564,69 @@ def run_hgemm(
     print(f"Cute achieved TOPS: {GEMM_TOPS / cute_avg_time_us * 1e6:.2f}")
 
 
-if __name__ == "__main__":
+def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="example of elementwise ops to demonstrate the numpy/pytorch as input for kernels"
+        description="Example of elementwise ops to demonstrate the numpy/pytorch as input for kernels"
     )
-    parser.add_argument("--M", "-M", default=1024, type=int)
-    parser.add_argument("--N", "-N", default=2048, type=int)
-    parser.add_argument("--K", "-K", default=4096, type=int)
-    parser.add_argument("--L", "-L", default=1, type=int)
-    parser.add_argument("--blas", type=str, default="tn", choices=["tn", "tt", "nn", "nt"])
+    parser.add_argument(
+        "--mnkl",
+        type=parse_comma_separated_ints,
+        default=(1024, 2048, 4096, 1),
+        help="MNKL dimensions (comma-separated)",
+    )
+    parser.add_argument(
+        "--tile_shape_mnk",
+        type=parse_comma_separated_ints,
+        choices=[
+            (64, 64, 64),
+            (64, 128, 64),
+            (128, 64, 64),
+            (128, 128, 64),
+            (128, 256, 64),
+            (128, 128, 128),
+        ],
+        default=(128, 128, 64),
+        help="CTA tile shape (comma-separated)",
+    )
+    parser.add_argument("--a-dtype", type=str, default="float16")
+    parser.add_argument("--b-dtype", type=str, default="float16")
+    parser.add_argument("--c-dtype", type=str, default="float16")
+    parser.add_argument("--acc-dtype", type=str, default="float32")
+    parser.add_argument("--a-major", type=str, choices=["k", "m"], default="k")
+    parser.add_argument("--b-major", type=str, choices=["k", "n"], default="k")
+    parser.add_argument("--c-major", type=str, choices=["n", "m"], default="n")
     parser.add_argument("--warmup-iterations", default=10, type=int)
     parser.add_argument("--iterations", default=100, type=int)
     parser.add_argument("--skip-verify", action="store_true")
     parser.add_argument("--dynamic-layout", action="store_true")
     parser.add_argument("--verbose", action="store_true")
+
     args = parser.parse_args()
+    if len(args.mnkl) != 4:
+        parser.error("--mnkl must contain exactly 4 values")
+    return args
+
+
+if __name__ == "__main__":
+    args = parse_arguments()
 
     check_cuda()
 
     VERBOSE = args.verbose
 
-    run_hgemm(
-        args.M,
-        args.N,
-        args.K,
-        args.L,
-        blas=args.blas,
-        skip_verify=args.skip_verify,
-        dynamic_layout=args.dynamic_layout,
+    run_gemm(
+        args.mnkl,
+        args.tile_shape_mnk,
+        str_to_cutlass_dtype(args.a_dtype),
+        str_to_cutlass_dtype(args.b_dtype),
+        str_to_cutlass_dtype(args.c_dtype),
+        str_to_cutlass_dtype(args.acc_dtype),
+        args.a_major,
+        args.b_major,
+        args.c_major,
         warmup_iterations=args.warmup_iterations,
         iterations=args.iterations,
+        skip_verify=args.skip_verify,
+        dynamic_layout=args.dynamic_layout,
     )
     print("PASS!")

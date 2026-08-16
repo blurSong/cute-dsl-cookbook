@@ -201,7 +201,7 @@ def hgemm_kernel(
     offset_bidx, offset_bidy = raster_tile(bidx, bidy, raster_factor)
     original_grid_dim = cute.ceil_div(C.shape, (tile_m, tile_n, 1))
     if offset_bidx >= original_grid_dim[0] or offset_bidy >= original_grid_dim[1]:
-        pass
+        return
 
     cta_coord = (offset_bidx, offset_bidy, None)
 

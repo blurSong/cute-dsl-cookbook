@@ -40,40 +40,60 @@ def derasterize(x, y, f):
     return (new_x, new_y)
 
 
+def flush_torch_l2_cache() -> None:
+    from cutlass.utils import HardwareInfo
+
+    l2_cache_bytes = HardwareInfo().get_l2_cache_size_in_bytes()
+    l2_flush_buffer = torch.empty(
+        l2_cache_bytes * 2 // 4,
+        dtype=torch.int32,
+        device=torch.device("cuda", torch.cuda.current_device()),
+    )
+    l2_flush_buffer.zero_()
+
+
 def benchmark_torch(
     fn: Callable,
     workspace_generator: Callable,
     workspace_count: int = 1,
     warmup_iterations: int = 10,
     iterations: int = 100,
-):
-    assert fn is not None
-    assert workspace_generator is not None
-    assert warmup_iterations >= 0
-    assert iterations > 0
+) -> float:
+    if not callable(fn):
+        raise TypeError("fn must be callable")
+    if not callable(workspace_generator):
+        raise TypeError("workspace_generator must be callable")
+    if workspace_count < 1:
+        raise ValueError("workspace_count must be at least 1")
+    if warmup_iterations < 0:
+        raise ValueError("warmup_iterations must be non-negative")
+    if iterations < 1:
+        raise ValueError("iterations must be at least 1")
 
     workspaces = [workspace_generator() for _ in range(workspace_count)]
 
-    workspace_index = 0
-    torch.cuda.empty_cache()
-    for _ in range(warmup_iterations):
-        workspace = workspaces[workspace_index]
-        fn(*workspace)
-        workspace_index = (workspace_index + 1) % workspace_count
-    torch.cuda.synchronize()
+    def loop_and_call(iteration_count: int, workspace_index: int = 0) -> int:
+        for _ in range(iteration_count):
+            workspace = workspaces[workspace_index]
+            fn(*workspace)
+            workspace_index = (workspace_index + 1) % workspace_count
+        return workspace_index
 
+    stream = torch.cuda.current_stream()
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
-    start_event.record()
-    for _ in range(iterations):
-        workspace = workspaces[workspace_index]
-        fn(*workspace)
-        workspace_index = (workspace_index + 1) % workspace_count
-    end_event.record()
-    torch.cuda.synchronize()
-    elapsed_time_ms = start_event.elapsed_time(end_event)
-    avg_time_ms = elapsed_time_ms / iterations
-    return avg_time_ms * 1e3  # return in microseconds
+
+    with torch.cuda.stream(stream):
+        if workspace_count > 1:
+            flush_torch_l2_cache()
+
+        workspace_index = loop_and_call(warmup_iterations)
+        start_event.record(stream)
+        loop_and_call(iterations, workspace_index)
+        end_event.record(stream)
+
+    end_event.synchronize()
+    return start_event.elapsed_time(end_event) / iterations * 1e3
 
 
 def parse_comma_separated_ints(value: str) -> Tuple[int, ...]:

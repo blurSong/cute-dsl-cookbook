@@ -532,7 +532,7 @@ def run_gemm(
     def torch_workspace_generator():
         return [
             "mkl,nkl->mnl",
-            *general_tensor_generator(return_type="torch"),
+            *general_tensor_generator(return_type="torch")[:2],
         ]
 
     def cute_workspace_generator():
